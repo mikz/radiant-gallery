@@ -1,6 +1,8 @@
-# Copyright (c) 2007, 2008, 2009 - R.W. van 't Veer
+# Copyright (c) 2007, 2008, 2009, 2010, 2011 - R.W. van 't Veer
 
+require 'exifr'
 require 'rational'
+require 'enumerator'
 
 module EXIFR
   # = TIFF decoder
@@ -237,10 +239,12 @@ module EXIFR
     IFD_TAGS = [:image, :exif, :gps] # :nodoc:
 
     time_proc = proc do |value|
-      if value =~ /^(\d{4}):(\d\d):(\d\d) (\d\d):(\d\d):(\d\d)$/
-        Time.mktime($1.to_i, $2.to_i, $3.to_i, $4.to_i, $5.to_i, $6.to_i) rescue nil
-      else
-        value
+      value.map do |value|
+        if value =~ /^(\d{4}):(\d\d):(\d\d) (\d\d):(\d\d):(\d\d)$/
+          Time.mktime($1.to_i, $2.to_i, $3.to_i, $4.to_i, $5.to_i, $6.to_i) rescue nil
+        else
+          value
+        end
       end
     end
 
@@ -253,6 +257,11 @@ module EXIFR
       # Field value.
       def to_i
         @value
+      end
+
+      # Debugging output.
+      def inspect
+        "\#<EXIFR::TIFF::Orientation:#{@type}(#{@value})>"
       end
 
       # Rotate and/or flip for proper viewing.
@@ -291,12 +300,27 @@ module EXIFR
       const_set("#{type}Orientation", ORIENTATIONS[index] = Orientation.new(index, type))
     end
 
+    class Degrees < Array
+      def initialize(arr)
+        raise MalformedTIFF, "expected [degrees, minutes, seconds]" unless arr.length == 3
+        super
+      end
+      
+      def to_f
+        reduce { |m,v| m * 60 + v}.to_f / 3600
+      end
+    end
+
     ADAPTERS = Hash.new { proc { |v| v } } # :nodoc:
     ADAPTERS.merge!({
       :date_time_original => time_proc,
       :date_time_digitized => time_proc,
       :date_time => time_proc,
-      :orientation => proc { |v| ORIENTATIONS[v] }
+      :orientation => proc { |v| v.map{|v| ORIENTATIONS[v]} },
+      :gps_latitude => proc { |v| Degrees.new(v) },
+      :gps_longitude => proc { |v| Degrees.new(v) },
+      :gps_dest_latitude => proc { |v| Degrees.new(v) },
+      :gps_dest_longitude => proc { |v| Degrees.new(v) }                      
     })
 
     # Names for all recognized TIFF fields.
@@ -304,20 +328,20 @@ module EXIFR
 
     # +file+ is a filename or an IO object.  Hint: use StringIO when working with slurped data like blobs.
     def initialize(file)
-      data = Data.new(file)
-
-      @ifds = [IFD.new(data)]
-      while ifd = @ifds.last.next
-        break if @ifds.find{|i| i.offset == ifd.offset}
-        @ifds << ifd
-      end
-
-      @jpeg_thumbnails = @ifds.map do |ifd|
-        if ifd.jpeg_interchange_format && ifd.jpeg_interchange_format_length
-          start, length = ifd.jpeg_interchange_format, ifd.jpeg_interchange_format_length
-          data[start..(start + length)]
+      Data.open(file) do |data|
+        @ifds = [IFD.new(data)]
+        while ifd = @ifds.last.next
+          break if @ifds.find{|i| i.offset == ifd.offset}
+          @ifds << ifd
         end
-      end.compact
+
+        @jpeg_thumbnails = @ifds.map do |ifd|
+          if ifd.jpeg_interchange_format && ifd.jpeg_interchange_format_length
+            start, length = ifd.jpeg_interchange_format, ifd.jpeg_interchange_format_length
+            data[start..(start + length)]
+          end
+        end.compact
+      end
     end
 
     # Number of images.
@@ -350,7 +374,7 @@ module EXIFR
 
     def respond_to?(method) # :nodoc:
       super ||
-        (@ifds && @ifds.first && @ifds.first.respond_to?(method)) ||
+        (defined?(@ifds) && @ifds && @ifds.first && @ifds.first.respond_to?(method)) ||
         TAGS.include?(method.to_s)
     end
 
@@ -374,6 +398,17 @@ module EXIFR
     # Get a hash presentation of the (first) image.
     def to_hash; @ifds.first.to_hash; end
 
+    GPS = Struct.new(:latitude, :longitude, :altitude, :image_direction)
+
+    # Get GPS location, altitude and image direction return nil when not available.
+    def gps
+      return nil unless gps_latitude && gps_longitude
+      GPS.new(gps_latitude.to_f * (gps_latitude_ref == 'S' ? -1 : 1),
+              gps_longitude.to_f * (gps_longitude_ref == 'W' ? -1 : 1),
+              gps_altitude && (gps_altitude.to_f * (gps_altitude_ref == "\1" ? -1 : 1)),
+              gps_img_direction && gps_img_direction.to_f)
+    end
+
     def inspect # :nodoc:
       @ifds.inspect
     end
@@ -394,6 +429,8 @@ module EXIFR
         end
 
         @offset_next = @data.readlong(pos)
+      rescue
+        @offset_next = 0
       end
 
       def method_missing(method, *args)
@@ -405,16 +442,15 @@ module EXIFR
       def height; image_length; end
 
       def to_hash
-        @hash ||= begin
-          result = @fields.dup
-          result.delete_if { |key,value| value.nil? }
-          result.each do |key,value|
-            if IFD_TAGS.include? key
-              result.merge!(value.to_hash)
-              result.delete key
-            end
+        @hash ||= @fields.map do |key,value|
+          if value.nil?
+            {}
+          elsif IFD_TAGS.include?(key)
+            value.to_hash
+          else
+            {key => value}
           end
-        end
+        end.inject { |m,v| m.merge(v) } || {}
       end
 
       def inspect
@@ -441,7 +477,7 @@ module EXIFR
         if IFD_TAGS.include? tag
           @fields[tag] = IFD.new(@data, field.offset, tag)
         else
-          value = field.value.map { |v| ADAPTERS[tag][v] } if field.value
+          value = ADAPTERS[tag][field.value]
           @fields[tag] = value.kind_of?(Array) && value.size == 1 ? value.first : value
         end
       end
@@ -452,55 +488,99 @@ module EXIFR
 
       def initialize(data, pos)
         @tag, count, @offset = data.readshort(pos), data.readlong(pos + 4), data.readlong(pos + 8)
+        @type = data.readshort(pos + 2)
 
-        case data.readshort(pos + 2)
-        when 1, 6 # byte, signed byte
-          # TODO handle signed bytes
+        case @type
+        when 1 # byte
           len, pack = count, proc { |d| d }
+        when 6 # signed byte
+          len, pack = count, proc { |d| sign_byte(d) }
         when 2 # ascii
-          len, pack = count, proc { |d| d.strip }
-        when 3, 8 # short, signed short
-          # TODO handle signed
+          len, pack = count, proc { |d| d.unpack("A*") }
+        when 3 # short
           len, pack = count * 2, proc { |d| d.unpack(data.short + '*') }
-        when 4, 9 # long, signed long
-          # TODO handle signed
+        when 8 # signed short
+          len, pack = count * 2, proc { |d| d.unpack(data.short + '*').map{|n| sign_short(n)} }
+        when 4 # long
           len, pack = count * 4, proc { |d| d.unpack(data.long + '*') }
-        when 5, 10
+        when 9 # signed long
+          len, pack = count * 4, proc { |d| d.unpack(data.long + '*').map{|n| sign_long(n)} }
+        when 7 # undefined
+          # UserComment
+          if @tag == 0x9286
+            len, pack = count, proc { |d| d.strip }
+            len -= 8 # reduce to account for first 8 bytes
+            start = len > 4 ? @offset + 8 : (pos + 8) # UserComment first 8-bytes is char code
+            @value = [pack[data[start..(start + len - 1)]]].flatten
+          end
+        when 5 # unsigned rational
           len, pack = count * 8, proc do |d|
-            r = []
-            d.unpack(data.long + '*').each_with_index do |v,i|
-              i % 2 == 0 ? r << [v] : r.last << v
+            rationals = []
+            d.unpack(data.long + '*').each_slice(2) do |f|
+              rationals << rational(*f)
             end
-            r.map do |f|
-              if f[1] == 0 # allow NaN and Infinity
-                f[0].to_f.quo(f[1])
-              else
-                Rational.respond_to?(:reduce) ? Rational.reduce(*f) : f[0].quo(f[1])
-              end
+            rationals
+          end
+        when 10 # signed rational
+          len, pack = count * 8, proc do |d|
+            rationals = []
+            d.unpack(data.long + '*').map{|n| sign_long(n)}.each_slice(2) do |f|
+              rationals << rational(*f)
             end
+            rationals
           end
         end
 
-        if len && pack
+        if len && pack && @type != 7
           start = len > 4 ? @offset : (pos + 8)
-          @value = [pack[data[start..(start + len - 1)]]].flatten
+          d = data[start..(start + len - 1)]
+          @value = d && [pack[d]].flatten
+        end
+      end
+
+    private
+      def sign_byte(n)
+        (n & 0x80) != 0 ? n - 0x100 : n
+      end
+
+      def sign_short(n)
+        (n & 0x8000) != 0 ? n - 0x10000 : n
+      end
+
+      def sign_long(n)
+        (n & 0x80000000) != 0 ? n - 0x100000000 : n
+      end
+
+      def rational(n, d)
+        if d == 0 # allow NaN and Infinity
+          n.to_f.quo(d)
+        else
+          Rational.respond_to?(:reduce) ? Rational.reduce(n, d) : n.quo(d)
         end
       end
     end
 
     class Data #:nodoc:
-      attr_reader :short, :long
+      attr_reader :short, :long, :file
 
       def initialize(file)
-        @file = file.respond_to?(:read) ? file : File.open(file, 'rb')
+        @io = file.respond_to?(:read) ? file : (@file = File.open(file, 'rb'))
         @buffer = ''
         @pos = 0
 
         case self[0..1]
         when 'II'; @short, @long = 'v', 'V'
         when 'MM'; @short, @long = 'n', 'N'
-        else; raise 'no II or MM marker found'
+        else
+          raise MalformedTIFF, "no byte order information found"
         end
+      end
+
+      def self.open(file, &block)
+        data = new(file)
+        yield data
+      ensure
+        data && data.file && data.file.close
       end
 
       def [](pos)
@@ -512,7 +592,7 @@ module EXIFR
           read_for(pos)
         end
 
-        @buffer[(pos.begin - @pos)..(pos.end - @pos)]
+        @buffer && @buffer[(pos.begin - @pos)..(pos.end - @pos)]
       end
 
       def readshort(pos)
@@ -524,14 +604,14 @@ module EXIFR
       end
 
       def size
-        @file.seek(0, IO::SEEK_END)
-        @file.pos
+        @io.seek(0, IO::SEEK_END)
+        @io.pos
       end
 
     private
       def read_for(pos)
-        @file.seek(@pos = pos.begin)
-        @buffer = @file.read([pos.end - pos.begin, 4096].max)
+        @io.seek(@pos = pos.begin)
+        @buffer = @io.read([pos.end - pos.begin, 4096].max)
       end
     end
   end

@@ -68,7 +68,8 @@ storage can be updated by also config/environment.rb
 	    Radiant::Config["gallery.storage"] = "file_system"
 	  end                                         
 
-For a discussion on exif_names see bottom of this document.
+Source code for exif library can be found at https://github.com/remvee/exifr and is included in the lib folder.
+All detected Exif value keys are found in lib/exifr/tiff.rb file.
   
 == Documentation
 
